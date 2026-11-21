@@ -1,9 +1,12 @@
-"""LangGraph distractor agent — DINOv2 fallback edition.
+"""LangGraph distractor agent — perimeter NCC + probe.
 
-Primary path:  ID exploitation  (1 call)
-Fallback path: DINOv2 embedding + k-means clustering
-                (ring texture from main cutout vs decoy cutout separates in embedding space)
-Final fallback: position-centric probe
+Pipeline:
+  1. Fetch board and piece images.
+  2. Detect the hole centre (Hough circles) and radius.
+  3. Score each piece via NCC between its outer-edge strip and the hole-perimeter
+     ring; low NCC → suspected distractor.
+  4. Probe each suspect with try_fit (home-estimate sweep + ring fallback).
+     Pieces that never snap are declared distractors.
 """
 from __future__ import annotations
 
@@ -272,16 +275,32 @@ def _color_sim(board_rgb: np.ndarray, piece_png: bytes,
   
 
 def _find_hole_centre(board_gray: np.ndarray, board_h: int) -> tuple[float, float]:
-    crop = board_gray[:board_h, :].astype(np.float32)
-    h, w = crop.shape[:2]
+    crop = board_gray[:board_h, :].astype(np.uint8)
+    h, w = crop.shape
     if h < 50 or w < 50:
         return w / 2.0, h / 2.0
-    blurred = cv2.GaussianBlur(crop, (41, 41), 0)
-    diff = cv2.absdiff(crop, blurred)
+
+    # Primary: Hough circles — the hole has a strong circular edge.
+    blurred = cv2.GaussianBlur(crop, (9, 9), 2)
+    min_r = max(40, min(h, w) // 8)
+    max_r = min(h, w) // 2
+    circles = cv2.HoughCircles(blurred, cv2.HOUGH_GRADIENT, dp=1,
+                                minDist=min(h, w) // 2,
+                                param1=60, param2=28,
+                                minRadius=min_r, maxRadius=max_r)
+    if circles is not None:
+        x, y, r = circles[0][0]
+        cx, cy = float(x), float(y)
+        print(f"[CV] hole centre (Hough) ~ ({cx:.0f}, {cy:.0f}) r={r:.0f}")
+        return cx, cy
+
+    # Fallback: darkest large-uniform region (original method).
+    crop_f = crop.astype(np.float32)
+    diff = cv2.absdiff(crop_f, cv2.GaussianBlur(crop_f, (41, 41), 0))
     smooth = cv2.GaussianBlur(diff, (61, 61), 0)
     _, _, min_loc, _ = cv2.minMaxLoc(smooth)
     cx, cy = float(min_loc[0]), float(min_loc[1])
-    print(f"[CV] hole centre ~ ({cx:.0f}, {cy:.0f})")
+    print(f"[CV] hole centre (fallback) ~ ({cx:.0f}, {cy:.0f})")
     return cx, cy
 
 
@@ -297,12 +316,10 @@ class State(TypedDict):
     pieces: list
     board_png: bytes
     piece_pngs: Dict[int, bytes]
-    dino_scores: Dict[int, float]
-    dino_confident: bool
+    ncc_scores: Dict[int, float]
     hole_cx: float
     hole_cy: float
     confirmed_distractors: List[int]
-    use_fast_path: bool
     home_positions: dict
     hole_r: float
 
@@ -312,36 +329,21 @@ class State(TypedDict):
 class LangGraphAgent(DistractorAgent):
     name = "langgraph"
     STATEFUL = False
-    # Set True to bypass ID fast-path and always run DINOv2 (for testing)
-    TEST_DINO: bool = True
 
     def solve(self, tools: ToolsProxy) -> List[int]:
 
         def gather(state: State) -> dict:
             task_info = tools.task()
             pieces = tools.list_pieces()
-            ids = sorted(p["id"] for p in pieces)
-            n = task_info["n_pieces"]
-            fast = not LangGraphAgent.TEST_DINO and ids == list(range(n))
-            print(f"[gather] ids={ids}  fast={'yes' if fast else 'no'}")
+            print(f"[gather] ids={sorted(p['id'] for p in pieces)}")
             return {
                 "task_info": task_info, "pieces": pieces,
                 "board_png": b"", "piece_pngs": {},
-                "dino_scores": {}, "dino_confident": False,
+                "ncc_scores": {},
                 "hole_cx": 0.0, "hole_cy": 0.0,
-                "confirmed_distractors": [], "use_fast_path": fast,
+                "confirmed_distractors": [],
                 "home_positions": {}, "hole_r": 0.0,
             }
-
-        def route_after_gather(state: State) -> str:
-            return "id_submit" if state["use_fast_path"] else "load_images"
-
-        def id_submit(state: State) -> dict:
-            n_d = state["task_info"]["n_distractors"]
-            ids = sorted(p["id"] for p in state["pieces"])
-            distractors = ids[-n_d:]
-            print(f"[id-exploit] distractors={distractors}  calls={tools.calls_used}")
-            return {"confirmed_distractors": distractors}
 
         def load_images(state: State) -> dict:
             board_png = tools.board_image_png()
@@ -359,99 +361,110 @@ class LangGraphAgent(DistractorAgent):
                 board_rgb, board_gray, state["piece_pngs"], cx, cy, n_dist
             )
             return {
-                "dino_scores": scores, "dino_confident": confident,
+                "ncc_scores": scores,
                 "hole_cx": cx, "hole_cy": cy,
                 "home_positions": home_pos, "hole_r": r_hole,
                 "confirmed_distractors": distractors,
             }
 
-        def route_after_perimeter(state: State) -> str:
-            return "cluster_submit" if state["dino_confident"] else "probe"
-
-        def cluster_submit(state: State) -> dict:
-            print(f"[cluster] submitting {state['confirmed_distractors']}")
-            return {}
-
         def probe(state: State) -> dict:
             n_dist = state["task_info"]["n_distractors"]
             all_ids = [p["id"] for p in state["pieces"]]
-            cx, cy = state["hole_cx"], state["hole_cy"]
-            scores = state["dino_scores"]
+            board = state["task_info"]["canvas"]["board"]
+            scores = state["ncc_scores"]
             home_pos = state.get("home_positions", {})
-            probe_r = 0.6 * state["hole_r"]
             RESERVE = 4
+            n_real = len(all_ids) - n_dist
 
+            cx, cy = state["hole_cx"], state["hole_cy"]
+            bw, bh = board["w"], board["h"]
+            centre_fallback = cx < bw * 0.1 or cy < bh * 0.1 or cx > bw * 0.9 or cy > bh * 0.9
+            if centre_fallback:
+                cx = board["x"] + bw / 2
+                cy = board["y"] + bh / 2
+                print(f"[probe] CV centre out of bounds, using board centre ({cx:.0f},{cy:.0f})")
+
+            hole_r = (min(board["w"], board["h"]) * 0.22) if (centre_fallback or state["hole_r"] <= 10) \
+                else state["hole_r"]
             suspect_order = sorted(all_ids, key=lambda i: scores.get(i, 0.0))
-            ring = _ring_points(cx, cy, probe_r, 11)
-
-            confirmed_distractor: List[int] = []
             confirmed_real: set[int] = set()
+            confirmed_distractor: List[int] = []
 
-            for pid in suspect_order:
-                if len(confirmed_distractor) >= n_dist:
-                    break
-                if tools.calls_used >= tools.budget - RESERVE:
-                    break
-                snapped = False
-                # Phase 1: home position estimate + angular sweep
-                if pid in home_pos:
-                    hx, hy = home_pos[pid]
-                    r_p = math.hypot(hx - cx, hy - cy)
-                    base_a = math.atan2(hy - cy, hx - cx)
-                    for deg in [0, -15, 15, -30, 30]:
-                        if tools.calls_used >= tools.budget - RESERVE:
-                            break
-                        a = base_a + deg * math.pi / 180
-                        if tools.try_fit(pid, cx + r_p * math.cos(a),
-                                            cy + r_p * math.sin(a))["snapped"]:
-                            confirmed_real.add(pid)
-                            snapped = True
-                            break
-                # Phase 2: full ring fallback
-                if not snapped:
-                    for x, y in ring:
-                        if tools.calls_used >= tools.budget - RESERVE:
-                            break
-                        if tools.try_fit(pid, x, y)["snapped"]:
-                            confirmed_real.add(pid)
-                            snapped = True
-                            break
-                if not snapped:
-                    confirmed_distractor.append(pid)
+            cv_has_signal = any(v != 0.0 for v in scores.values())
 
-            if len(confirmed_distractor) >= n_dist:
-                distractors = sorted(confirmed_distractor[:n_dist])
+            if cv_has_signal:
+                ring = _ring_points(cx, cy, 0.6 * hole_r, 11)
+                for pid in suspect_order:
+                    if len(confirmed_distractor) >= n_dist:
+                        break
+                    if tools.calls_used >= tools.budget - RESERVE:
+                        break
+                    snapped = False
+                    # Phase 1: home position estimate + angular sweep
+                    if pid in home_pos:
+                        hx, hy = home_pos[pid]
+                        r_p = math.hypot(hx - cx, hy - cy)
+                        base_a = math.atan2(hy - cy, hx - cx)
+                        for deg in [0, -15, 15, -30, 30]:
+                            if tools.calls_used >= tools.budget - RESERVE:
+                                break
+                            a = base_a + deg * math.pi / 180
+                            if tools.try_fit(pid, cx + r_p * math.cos(a),
+                                             cy + r_p * math.sin(a))["snapped"]:
+                                confirmed_real.add(pid)
+                                snapped = True
+                                break
+                    # Phase 2: ring fallback
+                    if not snapped:
+                        for x, y in ring:
+                            if tools.calls_used >= tools.budget - RESERVE:
+                                break
+                            if tools.try_fit(pid, x, y)["snapped"]:
+                                confirmed_real.add(pid)
+                                snapped = True
+                                break
+                    if not snapped:
+                        confirmed_distractor.append(pid)
+
+                distractors = sorted(confirmed_distractor[:n_dist]) if len(confirmed_distractor) >= n_dist \
+                    else sorted(([p for p in suspect_order if p not in confirmed_real])[:n_dist])
             else:
-                not_real = [p for p in suspect_order if p not in confirmed_real]
-                distractors = sorted(not_real[:n_dist])
+                # No-CV path (mock / placeholder images): point-first sweep so budget
+                # is shared across all pieces rather than wasted on one.
+                probe_pts: List[tuple] = [(cx, cy)]
+                for r_frac in [0.3, 0.55, 0.8, 1.0]:
+                    r = r_frac * hole_r
+                    n_pts = max(8, int(2 * math.pi * r / 20))
+                    probe_pts.extend(_ring_points(cx, cy, r, n_pts))
+                probe_pts.sort(key=lambda p: (p[0] - cx) ** 2 + (p[1] - cy) ** 2)
+                active = list(all_ids)
+                for px, py in probe_pts:
+                    if len(active) <= n_dist or tools.calls_used >= tools.budget - RESERVE:
+                        break
+                    for pid in list(active):
+                        if tools.calls_used >= tools.budget - RESERVE:
+                            break
+                        if tools.try_fit(pid, px, py)["snapped"]:
+                            confirmed_real.add(pid)
+                            active.remove(pid)
+                distractors = sorted(active[:n_dist]) if len(active) >= n_dist \
+                    else sorted(([p for p in all_ids if p not in confirmed_real])[:n_dist])
 
-            print(f"[probe] confirmed_real={sorted(confirmed_real)} confirmed_dist={confirmed_distractor} distractors={sorted(distractors)}")
+            print(f"[probe] confirmed_real={sorted(confirmed_real)} distractors={sorted(distractors)}")
             tools.submit_distractors(distractors)
             return {}
       
-        def conclude(state: State) -> dict:
-            tools.submit_distractors(state["confirmed_distractors"])
-            return {}
-
         g = StateGraph(State)
         g.add_node("gather", gather)
-        g.add_node("id_submit", id_submit)
         g.add_node("load_images", load_images)
         g.add_node("perimeter_analyse", perimeter_analyse)
-        g.add_node("cluster_submit", cluster_submit)
         g.add_node("probe", probe)
-        g.add_node("conclude", conclude)
 
         g.set_entry_point("gather")
-        g.add_conditional_edges("gather", route_after_gather,
-                                {"id_submit": "id_submit", "load_images": "load_images"})
-        g.add_edge("id_submit", "conclude")
+        g.add_edge("gather", "load_images")
         g.add_edge("load_images", "perimeter_analyse")
-        g.add_conditional_edges("perimeter_analyse", route_after_perimeter,
-                                {"cluster_submit": "cluster_submit", "probe": "probe"})
-        g.add_edge("cluster_submit", "conclude")
+        g.add_edge("perimeter_analyse", "probe")
         g.add_edge("probe", END)
-        g.add_edge("conclude", END)
 
         app = g.compile()
         final = app.invoke({})
